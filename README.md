@@ -25,9 +25,9 @@ Created in 2 months using Chat GPT.
 
 1. Install dependencies:
 
-win - cmd "run as administrator"
-cd {path to folder}
-pip install -r requirements.txt
+* win - cmd "run as administrator"
+* cd {path to folder}
+* pip install -r requirements.txt
 
 2. Run the panel:
 
