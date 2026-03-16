@@ -2,7 +2,7 @@
 
 **Goose Panel** is a panel for launching multiple CS2 and automation farming case CS2.
 
-Created in 12 hours using Chat GPT.
+Created in 2 months using Chat GPT.
 
 
 ## 📌 Requirements
