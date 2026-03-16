@@ -31,8 +31,8 @@ Created in 2 months using Chat GPT.
 
 2. Run the panel:
 
-cd {insert path to folder}
-py main.py
+* cd {insert path to folder}
+* py main.py
 
 ---
 ## 🛠 Troubleshooting
