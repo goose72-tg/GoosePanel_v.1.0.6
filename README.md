@@ -29,7 +29,7 @@ win - cmd "run as administrator"
 cd {path to folder}
 pip install -r requirements.txt
 
-3. Run the panel:
+2. Run the panel:
 
 cd {insert path to folder}
 py main.py
