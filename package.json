@@ -1,0 +1,11 @@
+{
+  "name": "looter",
+  "version": "1.0.0",
+  "dependencies": {
+    "steam-session": "^1.3.3",
+    "steam-totp": "^2.1.2",
+    "steam-tradeoffer-manager": "^2.12.0",
+    "steam-user": "^4.29.2",
+    "steamcommunity": "^3.45.2"
+  }
+}

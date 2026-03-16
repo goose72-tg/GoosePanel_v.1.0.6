@@ -1,0 +1,2 @@
+cd/{путь}
+pyinstaller --onefile --noconsole --clean --name "GoosePanel" --icon=Icon1.ico --add-data "Icon1.ico;." --uac-admin main.py

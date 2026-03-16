@@ -1,0 +1,13 @@
+"video.cfg"
+{
+	"setting.fullscreen"		"0"
+	"setting.coop_fullscreen"		"0"
+	"setting.nowindowborder"		"0"
+	"setting.mat_vsync"		"0"
+	"setting.fullscreen_min_on_focus_loss"		"1"
+	"setting.defaultres"		"383"
+	"setting.defaultresheight"		"280"
+	"setting.shaderquality"		"0"
+	"setting.high_dpi"		"0"
+	"setting.monitor_index"		"0"
+}
