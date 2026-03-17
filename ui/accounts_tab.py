@@ -151,6 +151,7 @@ class AccountsControl(customtkinter.CTkTabview):
     def start_selected(self):
         with self._start_sequence_lock:
             if self._start_sequence_active:
+                self._logManager.add_log("⚠️ Start уже выполняется, дождитесь завершения")
                 return
             self._start_sequence_active = True
 
@@ -163,21 +164,27 @@ class AccountsControl(customtkinter.CTkTabview):
         cs2_exe_path = os.path.join(cs2_path, r"game\bin\win64\cs2.exe")
 
         if not os.path.isfile(steam_path) or not steam_path.lower().endswith(".exe"):
+            self._logManager.add_log(f"❌ Некорректный SteamPath: {steam_path}")
             self._finish_start_sequence()
             return
 
         if not os.path.isfile(cs2_exe_path):
+            self._logManager.add_log(f"❌ Не найден CS2 exe: {cs2_exe_path}")
             self._finish_start_sequence()
             return
 
         if not self._sync_required_cfg_files_to_cs2(cs2_path):
+            self._logManager.add_log("❌ Не удалось скопировать cfg-файлы в папку CS2")
             self._finish_start_sequence()
             return
 
         accounts_to_start = self.accountsManager.selected_accounts.copy()
         if not accounts_to_start:
+            self._logManager.add_log("⚠️ Нет выделенных аккаунтов для запуска")
             self._finish_start_sequence()
             return
+
+        self._logManager.add_log(f"🚀 Launch selected: {len(accounts_to_start)} аккаунтов")
 
         self.auto_cancelled = False
         self.auto_cancelled_by_user = False
