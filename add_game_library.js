@@ -359,4 +359,4 @@ client.on('disconnected', (eresult, msg) => {
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
 
-doLogOn();
+doLogOn(); 
