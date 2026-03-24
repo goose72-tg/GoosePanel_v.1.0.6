@@ -2,9 +2,11 @@ import os
 import re
 import shutil
 import threading
+import subprocess
 import customtkinter
 import time
 import keyboard
+import webbrowser
 
 from Helpers.LoginExecutor import SteamLoginSession
 from Managers.AccountsManager import AccountManager
@@ -39,6 +41,54 @@ class AccountsControl(customtkinter.CTkTabview):
         self.create_stat_buttons()
         
         self.accounts_list.set_control_frame(self)
+        self.booster_processes = {}
+
+    def _restore_account_color(self, account):
+        if self.accounts_list and self.accounts_list.is_farmed_account(account):
+            account.setColor("#ff9500")
+        elif self.accounts_list and self.accounts_list.is_drop_ready_account(account):
+            account.setColor("#a855f7")
+        else:
+            account.setColor("#DCE4EE")
+
+    def _get_account_booster_config(self, login):
+        account_configs = self._settingsManager.get("ActivityBoosterAccounts", {}) or {}
+        if not isinstance(account_configs, dict):
+            account_configs = {}
+        cfg = account_configs.get(login, {})
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _resolve_booster_settings(self, account):
+        account_cfg = self._get_account_booster_config(account.login)
+
+        min_minutes = int(account_cfg.get("min_minutes", self._settingsManager.get("ActivityBoosterMinMinutes", 60)) or 60)
+        max_minutes = int(account_cfg.get("max_minutes", self._settingsManager.get("ActivityBoosterMaxMinutes", 100)) or 100)
+        if min_minutes <= 0:
+            min_minutes = 60
+        if max_minutes < min_minutes:
+            max_minutes = min_minutes
+
+        game_appids = account_cfg.get("game_appids")
+        if game_appids is None:
+            game_appids = self._settingsManager.get("ActivityBoosterGameAppIds", []) or []
+        if not isinstance(game_appids, list):
+            game_appids = []
+
+        parsed_game_appids = []
+        seen = set()
+        for app_id in game_appids:
+            app_text = str(app_id).strip()
+            if not app_text.isdigit():
+                continue
+            app_id_int = int(app_text)
+            if app_id_int <= 0 or app_id_int in seen:
+                continue
+            parsed_game_appids.append(app_id_int)
+            seen.add(app_id_int)
+            if len(parsed_game_appids) >= 5:
+                break
+
+        return min_minutes, max_minutes, parsed_game_appids
 
     # ----------------- Вкладка Accounts Control -----------------
     def create_control_buttons(self):
@@ -81,8 +131,56 @@ class AccountsControl(customtkinter.CTkTabview):
                     print(f"🟠 [{login}] Белый -> оранжевый")
 
             self.accounts_list._save_farmed_accounts()
-            self.accountsManager.selected_accounts.clear()
-            self.update_label()
+        self.accountsManager.selected_accounts.clear()
+        self.update_label()
+
+    def stop_booster_selected(self):
+        selected_accounts = self.accountsManager.selected_accounts.copy()
+        if not selected_accounts:
+            self._logManager.add_log("⚠️ Нет выделенных аккаунтов для остановки booster")
+            return
+
+        stopped = 0
+        for acc in selected_accounts:
+            booster_proc = self.booster_processes.get(acc.login)
+            if not booster_proc or booster_proc.poll() is not None:
+                self.booster_processes.pop(acc.login, None)
+                self._restore_account_color(acc)
+                self._logManager.add_log(f"⚠️ [{acc.login}] booster не запущен")
+                continue
+
+            try:
+                booster_proc.kill()
+                stopped += 1
+                self._restore_account_color(acc)
+                self._logManager.add_log(f"🛑 [{acc.login}] Activity booster остановлен")
+            except Exception as exc:
+                self._logManager.add_log(f"❌ [{acc.login}] Ошибка остановки booster: {exc}")
+            finally:
+                self.booster_processes.pop(acc.login, None)
+
+        if stopped > 0:
+            self._logManager.add_log(f"🛑 Stop booster: остановлено {stopped} аккаунтов")
+
+        self.accountsManager.selected_accounts.clear()
+        self.update_label()
+
+    def stop_all_boosters(self):
+        if not self.booster_processes:
+            return
+
+        for login, booster_proc in list(self.booster_processes.items()):
+            try:
+                if booster_proc and booster_proc.poll() is None:
+                    booster_proc.kill()
+                    self._logManager.add_log(f"🛑 [{login}] Booster остановлен при закрытии панели")
+            except Exception:
+                pass
+            finally:
+                acc = self.accountsManager.get_account(login)
+                if acc:
+                    self._restore_account_color(acc)
+                self.booster_processes.pop(login, None)
         else:
             print("⚠️ Нет ссылки на accounts_list")
 
@@ -320,6 +418,141 @@ class AccountsControl(customtkinter.CTkTabview):
         time.sleep(2)
         self._logManager.add_log("🔄 Авто Get Level для запущенных аккаунтов...")
         self.try_get_level_for_accounts(accounts)
+
+    def launch_steam_selected(self):
+        with self._start_sequence_lock:
+            if self._start_sequence_active:
+                self._logManager.add_log("⚠️ Другой запуск уже выполняется, дождитесь завершения")
+                return
+            self._start_sequence_active = True
+
+        steam_path = self._settingsManager.get(
+            "SteamPath", r"C:\Program Files (x86)\Steam\steam.exe"
+        )
+        if not os.path.isfile(steam_path) or not steam_path.lower().endswith(".exe"):
+            self._logManager.add_log(f"❌ Некорректный SteamPath: {steam_path}")
+            self._finish_start_sequence()
+            return
+
+        accounts_to_start = self.accountsManager.selected_accounts.copy()
+        if not accounts_to_start:
+            self._logManager.add_log("⚠️ Нет выделенных аккаунтов для Steam-only запуска")
+            self._finish_start_sequence()
+            return
+
+        self._logManager.add_log(
+            f"🚀 Launch Steam only: {len(accounts_to_start)} аккаунтов"
+        )
+
+        try:
+            for acc in accounts_to_start:
+                try:
+                    acc.setColor("yellow")
+                    acc.StartSteamOnly()
+                    self._logManager.add_log(
+                        f"✅ [{acc.login}] Steam запущен без запуска CS2"
+                    )
+                except Exception as error:
+                    acc.setColor("#DCE4EE")
+                    self._logManager.add_log(
+                        f"❌ [{acc.login}] Steam-only запуск не удался: {error}"
+                    )
+                time.sleep(1.5)
+        finally:
+            self.accountsManager.selected_accounts.clear()
+            self.update_label()
+            self._finish_start_sequence()
+
+    def open_steam_profile(self, login):
+        account = self.accountsManager.get_account(login)
+        if not account:
+            self._logManager.add_log(f"⚠️ [{login}] Аккаунт не найден")
+            return
+
+        steam_id = str(getattr(account, "steam_id", "") or "").strip()
+        if not steam_id or steam_id == "0":
+            self._logManager.add_log(f"⚠️ [{login}] В mafile отсутствует SteamID")
+            return
+
+        profile_url = f"https://steamcommunity.com/profiles/{steam_id}"
+        try:
+            webbrowser.open(profile_url)
+            self._logManager.add_log(f"🔗 [{login}] Открыт профиль Steam")
+        except Exception as exc:
+            self._logManager.add_log(f"❌ [{login}] Не удалось открыть профиль: {exc}")
+
+    def start_booster_selected(self):
+        selected_accounts = self.accountsManager.selected_accounts.copy()
+        if not selected_accounts:
+            self._logManager.add_log("⚠️ Нет выделенных аккаунтов для activity booster")
+            return
+
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        booster_script = os.path.join(project_root, "activity_booster.js")
+        if not os.path.isfile(booster_script):
+            self._logManager.add_log(f"❌ Файл activity_booster.js не найден: {booster_script}")
+            return
+
+        self._logManager.add_log(f"🎮 Start booster: {len(selected_accounts)} аккаунтов")
+
+        for acc in selected_accounts:
+            min_minutes, max_minutes, game_appids = self._resolve_booster_settings(acc)
+
+            if not acc.shared_secret:
+                self._logManager.add_log(f"⚠️ [{acc.login}] Нет shared_secret (mafile), пропускаю")
+                continue
+
+            steam_id = str(getattr(acc, "steam_id", "") or "").strip()
+            if not steam_id or steam_id == "0":
+                self._logManager.add_log(f"⚠️ [{acc.login}] Нет steamid в mafile, пропускаю")
+                continue
+
+            existing = self.booster_processes.get(acc.login)
+            if existing and existing.poll() is None:
+                self._logManager.add_log(f"⚠️ [{acc.login}] booster уже запущен")
+                continue
+
+            cmd = [
+                "node",
+                booster_script,
+                acc.login,
+                acc.password,
+                acc.shared_secret,
+                steam_id,
+                str(min_minutes),
+                str(max_minutes),
+                ",".join(str(x) for x in game_appids),
+            ]
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=project_root,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env={**os.environ, "NODE_NO_WARNINGS": "1"},
+                )
+                time.sleep(1)
+                if proc.poll() is not None:
+                    self._logManager.add_log(
+                        f"❌ [{acc.login}] Activity booster завершился сразу после запуска. "
+                        "Проверьте shared_secret/пароль и список appid."
+                    )
+                    continue
+                self.booster_processes[acc.login] = proc
+                acc.setColor("#4f8cff")
+                games_info = ",".join(str(x) for x in game_appids) if game_appids else "random"
+                self._logManager.add_log(
+                    f"✅ [{acc.login}] Activity booster запущен ({min_minutes}-{max_minutes} мин., games: {games_info})"
+                )
+            except FileNotFoundError:
+                self._logManager.add_log("❌ Не найден Node.js (команда node)")
+                return
+            except Exception as exc:
+                self._logManager.add_log(f"❌ [{acc.login}] Ошибка запуска booster: {exc}")
+
+        self.accountsManager.selected_accounts.clear()
+        self.update_label()
+
     def _refresh_modern_levels_ui(self):
         """Обновляет уровни в новом UI (ui/app.py), если он доступен."""
         try:
@@ -329,80 +562,29 @@ class AccountsControl(customtkinter.CTkTabview):
         except Exception:
             pass
     def try_get_level_for_accounts(self, accounts):
-        def worker():
-            for acc in accounts:
-                try:
-                    steam = SteamLoginSession(acc.login, acc.password, acc.shared_secret)
-                    html = None
-                    for attempt in range(2):
-                        html = self._fetch_html(steam, url_suffix="gcpd/730")
-                        if html:
-                            break
-
-                        if attempt == 0:
-                            self._logManager.add_log(f"({acc.login} error, return)")
-                        else:
-                            self._logManager.add_log(f"({acc.login} error parsing lvl)")
-                    if not html:
-                        continue
-                    rank_match = re.search(r'CS:GO Profile Rank:\s*([^\n<]+)', html)
-                    xp_match = re.search(r'Experience points earned towards next rank:\s*([^\n<]+)', html)
-                    if rank_match and xp_match:
-                        rank = rank_match.group(1).strip().replace(',', '')
-                        exp = xp_match.group(1).strip().replace(',', '').split()[0]
-                        
-                        try:
-                            level = int(rank)
-                            xp = int(exp)
-                            self._logManager.add_log(f"[{acc.login}]  lvl: {level} | xp: {xp}")
-                            if self.accounts_list:
-                                self.accounts_list.update_account_level(acc.login, level, xp)
-                            self._refresh_modern_levels_ui()
-                        except ValueError:
-                            self._logManager.add_log(f"[{acc.login}] ❌ Parse error")
-                except Exception as e:
-                    self._logManager.add_log(f"[{acc.login}] ❌ Auto level error: {e}")
-        
-        threading.Thread(target=worker, daemon=True).start()
+        try:
+            app = self.winfo_toplevel()
+            if hasattr(app, "fetch_levels_for_accounts"):
+                app.fetch_levels_for_accounts(accounts)
+                return
+            self._logManager.add_log("❌ App-level fetch_levels_for_accounts недоступен")
+        except Exception as e:
+            self._logManager.add_log(f"❌ Ошибка делегации get level: {e}")
 
     def try_get_level(self):
-        def worker():
-            for acc in self.accountsManager.selected_accounts:
-                try:
-                    steam = SteamLoginSession(acc.login, acc.password, acc.shared_secret)
-                    html = self._fetch_html(steam, url_suffix="gcpd/730")
-                    if not html:
-                        self._logManager.add_log(f"[{acc.login}] ❌ No HTML")
-                        continue
-
-                    print(f"⏳ [{acc.login}] Wait for JS...")
-                    time.sleep(1)
-
-                    level, xp = 0, 0
-                    rank_match = re.search(r'CS:GO Profile Rank:\s*([\d,]+)', html, re.IGNORECASE)
-                    if rank_match:
-                        level = int(rank_match.group(1).replace(',', ''))
-                        xp_match = re.search(r'Experience points earned towards next rank:\s*([\d,]+)', html, re.IGNORECASE)
-                        xp = int(xp_match.group(1).replace(',', '')) if xp_match else 0
-                    else:
-                        if re.search(r'"profile_rank"[:\s]*(\d+)', html):
-                            rank_match = re.search(r'"profile_rank"[:\s]*(\d+)', html)
-                            level = int(rank_match.group(1)) if rank_match else 0
-
-                    if level > 0:
-                        self._logManager.add_log(f"[{acc.login}] lvl: {level} | xp: {xp}")
-                        acc.update_level_xp(level, xp)
-                        self.accounts_list.update_account_level(acc.login, level, xp)
-                        self._refresh_modern_levels_ui()
-                    else:
-                        with open(f"debug_{acc.login}.html", "w", encoding="utf-8") as f:
-                            f.write(html)
-                        self._logManager.add_log(f"[{acc.login}] ❌ No level (debug_{acc.login}.html)")
-
-                except Exception as e:
-                    self._logManager.add_log(f"[{acc.login}] ❌ Error: {e}")
-
-        self._run_stat_with_lock(worker)
+        try:
+            app = self.winfo_toplevel()
+            if hasattr(app, "fetch_levels_for_accounts"):
+                
+                selected_accounts = self.accountsManager.selected_accounts.copy()
+                if not selected_accounts:
+                    self._logManager.add_log("⚠️ Нет выделенных аккаунтов")
+                    return
+                app.fetch_levels_for_accounts(selected_accounts)
+                return
+            self._logManager.add_log("❌ App-level fetch_levels_for_accounts недоступен")
+        except Exception as e:
+            self._logManager.add_log(f"❌ Ошибка делегации get level: {e}")
 
     def kill_selected(self):
         print("💀 УБИВАЮ ВЫБРАННЫЕ аккаунты!")
@@ -427,15 +609,23 @@ class AccountsControl(customtkinter.CTkTabview):
                     except:
                         pass
                     acc.CS2Process = None
+
+                booster_proc = self.booster_processes.get(acc.login)
+                if booster_proc and booster_proc.poll() is None:
+                    try:
+                        booster_proc.kill()
+                        killed += 1
+                        print(f"💀 Booster [{acc.login}]: {booster_proc.pid}")
+                    except Exception:
+                        pass
+                self.booster_processes.pop(acc.login, None)
                 
+                self._restore_account_color(acc)
                 if self.accounts_list and self.accounts_list.is_farmed_account(acc):
-                    acc.setColor("#ff9500")
                     print(f" [{acc.login}] Сброс - оранжевый цвет")
                 elif self.accounts_list and self.accounts_list.is_drop_ready_account(acc):
-                    acc.setColor("#a855f7")
                     print(f" [{acc.login}] Сброс - фиолетовый цвет")
                 else:
-                    acc.setColor("#DCE4EE")
                     print(f" [{acc.login}] Сброс - белый цвет")
                 
             except Exception as e:

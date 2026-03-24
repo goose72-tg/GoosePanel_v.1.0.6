@@ -1,5 +1,15 @@
 # Goose Panel
 
+* v1.0.7 was added/updated
+1. Tools 2
+2. Launch only Steam
+3. Start booster
+4. Stop booster
+5. Add game library
+6. fsn.cfg modified
+7. ui/
+8. managers/
+
 **Goose Panel** is a panel for launching multiple CS2 and automation farming case CS2.
 
 Created in 2 months using Chat GPT.
@@ -12,9 +22,11 @@ Created in 2 months using Chat GPT.
 | Python 3.13   | Required to run the panel |
 | Steam         | Latest version            |
 | CS2           | Latest version            |
-| Handle.exe    | utility with google       |
+| Handle.exe    | Utility from Google       |
+| Node.js       | Utility to send a drop    |
 
 **Handle.exe** - https://learn.microsoft.com/ru-ru/sysinternals/downloads/handle
+**Node.js** - https://nodejs.org/en/download
 
 > ⚠️ Important: Make sure `cmd` always runs as administrator for proper functionality.
 

@@ -302,10 +302,11 @@ class LobbyManager:
         return moved
 
     def _auto_create_lobbies(self):
-        ordered_accounts = self._get_accounts_sorted_by_window_position()
+        ordered_accounts = self._ensure_minimum_cs2_windows(required=4, attempts=3, delay=0.5)
         total = len(ordered_accounts)
         if total < 4:
-            self._logManager.add_log("❌ Нужно минимум 4 валидных CS2 окна для сборки лобби")
+            self._logManager.add_log("❌ Не удалось подготовить 4 валидных CS2 окна для сборки лобби после автоповторов")
+            self._log_cs2_windows_diagnostics()
             return False
 
         leader1 = ordered_accounts[0]
@@ -331,9 +332,10 @@ class LobbyManager:
 
     def _get_strict_4_accounts_by_window_order(self):
         """Возвращает строго 4 аккаунта в порядке окон слева-направо (слоты 1..4)."""
-        ordered_accounts = self._get_accounts_sorted_by_window_position()
+        ordered_accounts = self._ensure_minimum_cs2_windows(required=4, attempts=3, delay=0.5)
         if len(ordered_accounts) < 4:
-            self._logManager.add_log("❌ Нужно минимум 4 валидных CS2 окна")
+            self._logManager.add_log("❌ Не удалось строго зафиксировать 4 валидных CS2 окна после автоповторов")
+            self._log_cs2_windows_diagnostics()
             return None
 
         top4 = ordered_accounts[:4]
@@ -359,6 +361,43 @@ class LobbyManager:
         self._last_window_order_logins = [acc.login for acc in top4_accounts]
 
         return True
+
+    def _restore_account_window(self, account):
+        hwnd = self._resolve_account_cs2_hwnd(account)
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return False
+
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            return True
+        except Exception:
+            return False
+
+    def _ensure_minimum_cs2_windows(self, required=4, attempts=3, delay=0.5):
+        attempts = max(1, int(attempts))
+        required = max(1, int(required))
+
+        for attempt in range(1, attempts + 1):
+            ordered_accounts = self._get_accounts_sorted_by_window_position()
+            if len(ordered_accounts) >= required:
+                return ordered_accounts
+
+            if attempt == attempts:
+                break
+
+            self._logManager.add_log(
+                f"⚠️ Найдено только {len(ordered_accounts)}/{required} валидных окон CS2. "
+                f"Автовосстановление {attempt}/{attempts - 1}..."
+            )
+
+            self.lift_all_cs2_windows()
+            for account in self._accountManager.accounts:
+                if account.isCSValid():
+                    self._restore_account_window(account)
+
+            time.sleep(max(0.1, float(delay)))
+
+        return self._get_accounts_sorted_by_window_position()
 
     def _prepare_strict_4_windows_flow(self):
         """Подготовка без дополнительных пауз: move all -> align -> strict check."""
@@ -408,6 +447,36 @@ class LobbyManager:
         ordered.sort(key=lambda item: (item[0], item[1], item[2]))
 
         return [item[3] for item in ordered]
+
+    def _log_cs2_windows_diagnostics(self):
+        total_accounts = len(self._accountManager.accounts)
+        valid_accounts = [acc for acc in self._accountManager.accounts if acc.isCSValid()]
+        valid_with_windows = []
+
+        for account in valid_accounts:
+            hwnd = self._resolve_account_cs2_hwnd(account)
+            if hwnd and win32gui.IsWindow(hwnd):
+                valid_with_windows.append(account.login)
+
+        missing_validation = [acc.login for acc in self._accountManager.accounts if not acc.isCSValid()]
+        missing_windows = [acc.login for acc in valid_accounts if acc.login not in valid_with_windows]
+
+        self._logManager.add_log(
+            f"ℹ️ Диагностика окон CS2: всего аккаунтов={total_accounts}, "
+            f"isCSValid={len(valid_accounts)}, окно найдено={len(valid_with_windows)}"
+        )
+
+        if missing_validation:
+            self._logManager.add_log(
+                "ℹ️ Не прошли isCSValid (не запущен Steam/CS2 или нарушена связка процессов): "
+                + ", ".join(missing_validation)
+            )
+
+        if missing_windows:
+            self._logManager.add_log(
+                "ℹ️ Прошли isCSValid, но окно CS2 не найдено (свернуто/перекрыто/другое окно PID): "
+                + ", ".join(missing_windows)
+            )
 
     def _get_rect_for_account_window(self, account):
         pid = 0

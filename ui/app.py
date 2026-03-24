@@ -17,6 +17,7 @@ from pathlib import Path
 
 import customtkinter
 import requests
+from Helpers.LoginExecutor import SteamLoginSession
 from Managers.AccountsManager import AccountManager
 from Managers.LogManager import LogManager
 from Managers.SettingsManager import SettingsManager
@@ -181,7 +182,7 @@ class SteamRouteManager:
 class App(customtkinter.CTk):
     def __init__(self, gsi_manager=None, startup_gpu_info=None, startup_services_initializer=None):
         super().__init__()
-        self.title("Goose Panel | v.1.0.6")
+        self.title("Goose Panel | v.1.0.7")
         self._set_window_icon(self)
         self.gsi_manager = gsi_manager
         self.window_position_file = Path("window_position.txt")
@@ -594,14 +595,27 @@ class App(customtkinter.CTk):
         self.account_manager.selected_accounts.clear()
         self.update_label()
 
-    def update_account_level(self, login, level, xp):
+    def update_account_level(self, login, level, xp, queue_ui=True):
         existing = self.levels_cache.get(login, self.levels_cache.get(login.lower(), {}))
         current_data = existing if isinstance(existing, dict) else {}
         current_data.update({"level": level, "xp": xp})
 
         week_start_iso = self._get_weekly_window_start().isoformat()
-        baseline_level = current_data.get("weekly_baseline_level")
+
         baseline_start = current_data.get("weekly_baseline_start")
+        baseline_level = current_data.get("weekly_baseline_level")
+
+        # Если baseline отсутствует (null/не число), фиксируем текущий уровень
+        # как baseline для текущей недельной витрины.
+        if baseline_start != week_start_iso:
+            current_data["weekly_baseline_start"] = week_start_iso
+            current_data["weekly_baseline_level"] = level if isinstance(level, int) else None
+            current_data.pop("trade_sent_week_start", None)
+            baseline_start = current_data.get("weekly_baseline_start")
+            baseline_level = current_data.get("weekly_baseline_level")
+        elif not isinstance(baseline_level, int) and isinstance(level, int):
+            current_data["weekly_baseline_level"] = level
+            baseline_level = level
         has_take_drop = (
             baseline_start == week_start_iso
             and isinstance(level, int)
@@ -619,9 +633,76 @@ class App(customtkinter.CTk):
         if has_take_drop and account and login not in self.farmed_accounts:
             account.setColor("#a855f7")
 
-        self._queue_ui_action(self._refresh_level_labels)
-        self._queue_ui_action(self.update_label)
+        if queue_ui:
+            self._queue_ui_action(self._refresh_level_labels)
+            self._queue_ui_action(self.update_label)
 
+    def _fetch_account_gcpd_html(self, steam_session, retries=2):
+        for _ in range(max(1, retries)):
+            try:
+                steam_session.login()
+                response = steam_session.session.get(
+                    "https://steamcommunity.com/my/gcpd/730",
+                    timeout=15,
+                )
+                if response.status_code == 200 and response.text:
+                    return response.text
+            except Exception:
+                pass
+            time.sleep(0.35)
+        return None
+
+    def _parse_level_xp_from_html(self, html):
+        if not html:
+            return None, None
+
+        rank_match = re.search(r'CS:GO Profile Rank:\s*([^\n<]+)', html, re.IGNORECASE)
+        xp_match = re.search(r'Experience points earned towards next rank:\s*([^\n<]+)', html, re.IGNORECASE)
+        if rank_match and xp_match:
+            rank = rank_match.group(1).strip().replace(",", "")
+            exp = xp_match.group(1).strip().replace(",", "").split()[0]
+            try:
+                return int(rank), int(exp)
+            except ValueError:
+                return None, None
+
+        rank_json_match = re.search(r'"profile_rank"[:\s]*(\d+)', html)
+        if rank_json_match:
+            try:
+                return int(rank_json_match.group(1)), 0
+            except ValueError:
+                return None, None
+
+        return None, None
+
+    def fetch_levels_for_accounts(self, accounts):
+        updated_count = 0
+        for acc in list(accounts or []):
+            try:
+                steam = SteamLoginSession(acc.login, acc.password, acc.shared_secret)
+                html = self._fetch_account_gcpd_html(steam, retries=2)
+                if not html:
+                    self.log_manager.add_log(f"[{acc.login}] ❌ No HTML")
+                    continue
+
+                level, xp = self._parse_level_xp_from_html(html)
+                if level is None:
+                    self.log_manager.add_log(f"[{acc.login}] ❌ Parse error")
+                    continue
+
+                self.log_manager.add_log(f"[{acc.login}] lvl: {level} | xp: {xp}")
+                acc.update_level_xp(level, xp)
+                self.update_account_level(acc.login, level, xp, queue_ui=False)
+                updated_count += 1
+            except Exception as exc:
+                self.log_manager.add_log(f"[{acc.login}] ❌ Error: {exc}")
+
+        if updated_count:
+            self._queue_ui_action(self._refresh_level_labels)
+            self._queue_ui_action(self.update_label)
+        self._queue_ui_action(self._safe_ui_refresh)
+        return updated_count
+        
     def select_first_non_farmed(self, n=4):
         available_accounts = [acc for acc in self.account_manager.accounts if not self.is_reserved_from_rotation(acc)]
         count = min(n, len(available_accounts))
@@ -903,7 +984,7 @@ class App(customtkinter.CTk):
         main.grid(row=2, column=0, padx=10, pady=(0, 8), sticky="nsew")
         main.grid_columnconfigure(0, weight=2)
         main.grid_columnconfigure(1, weight=1)
-        main.grid_columnconfigure(2, weight=1)
+        main.grid_columnconfigure(2, weight=0, minsize=220)
         main.grid_rowconfigure(0, weight=1)
         main.grid_rowconfigure(1, weight=0)
 
@@ -939,10 +1020,42 @@ class App(customtkinter.CTk):
         self.srt_scroll.grid_columnconfigure(0, weight=1)
         self._build_srt_rows()
 
-        tools = customtkinter.CTkFrame(main, fg_color=BG_CARD, corner_radius=10, border_width=1, border_color=BG_BORDER)
-        tools.grid(row=0, column=2, padx=(6, 0), pady=0, sticky="nsew")
+        tools = customtkinter.CTkFrame(main, width=220, fg_color=BG_CARD, corner_radius=10, border_width=1, border_color=BG_BORDER)
+        tools.grid(row=0, column=2, padx=(6, 0), pady=0, sticky="ns")
+        tools.grid_propagate(False)
         tools.grid_columnconfigure(0, weight=1)
-        customtkinter.CTkLabel(tools, text="Extra Tools", text_color=TXT_MAIN, font=customtkinter.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=8, pady=(8, 6), sticky="w")
+        tools.grid_rowconfigure(1, weight=1)
+        tools_header = customtkinter.CTkFrame(tools, fg_color="transparent")
+        tools_header.grid(row=0, column=0, padx=8, pady=(8, 6), sticky="ew")
+        tools_header.grid_columnconfigure(0, weight=1)
+        self.tools_section_var = customtkinter.StringVar(value="Extra Tools 1")
+        self.tools_section_toggle = customtkinter.CTkSegmentedButton(
+            tools_header,
+            values=["Extra Tools 1", "Tools 2"],
+            variable=self.tools_section_var,
+            command=self._switch_tools_section,
+            fg_color=BG_CARD_ALT,
+            selected_color=ACCENT_BLUE,
+            selected_hover_color=ACCENT_BLUE_DARK,
+            unselected_color=BG_CARD_ALT,
+            unselected_hover_color=BG_BORDER,
+            text_color=TXT_MAIN,
+            font=customtkinter.CTkFont(size=12, weight="bold"),
+            height=30,
+        )
+        self.tools_section_toggle.grid(row=0, column=0, sticky="ew")
+
+        self.tools_content = customtkinter.CTkFrame(tools, fg_color="transparent")
+        self.tools_content.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="nsew")
+        self.tools_content.grid_columnconfigure(0, weight=1)
+        self.tools_content.grid_rowconfigure(0, weight=1)
+
+        self.tools_sections = {}
+        for section_name in ("Extra Tools 1", "Tools 2"):
+            section_frame = customtkinter.CTkFrame(self.tools_content, fg_color="transparent")
+            section_frame.grid(row=0, column=0, sticky="nsew")
+            section_frame.grid_columnconfigure(0, weight=1)
+            self.tools_sections[section_name] = section_frame
         extra_buttons = [
             ("Move all CS windows", self._action_move_all_cs_windows, BG_CARD_ALT),
             ("Kill ALL CS & Steam", self._action_kill_all_cs_and_steam, ACCENT_PURPLE),
@@ -952,8 +1065,54 @@ class App(customtkinter.CTk):
 
         ]
         for idx, (text, cmd, color) in enumerate(extra_buttons, start=1):
-            customtkinter.CTkButton(tools, text=text, command=cmd, fg_color=color, hover_color=BG_BORDER, height=34, font=customtkinter.CTkFont(size=11, weight="bold")).grid(row=idx, column=0, padx=8, pady=4, sticky="ew")
+            customtkinter.CTkButton(
+                self.tools_sections["Extra Tools 1"],
+                text=text,
+                command=cmd,
+                fg_color=color,
+                hover_color=BG_BORDER,
+                height=34,
+                font=customtkinter.CTkFont(size=11, weight="bold"),
+            ).grid(row=idx, column=0, padx=2, pady=4, sticky="ew")
 
+        customtkinter.CTkButton(
+            self.tools_sections["Tools 2"],
+            text="Launch steam",
+            command=self._action_launch_steam_selected,
+            fg_color=ACCENT_BLUE,
+            hover_color=ACCENT_BLUE_DARK,
+            height=34,
+            font=customtkinter.CTkFont(size=11, weight="bold"),
+        ).grid(row=1, column=0, padx=2, pady=4, sticky="ew")
+        customtkinter.CTkButton(
+            self.tools_sections["Tools 2"],
+            text="Start booster",
+            command=self._action_start_booster_selected,
+            fg_color=ACCENT_GREEN,
+            hover_color=BG_BORDER,
+            height=34,
+            font=customtkinter.CTkFont(size=11, weight="bold"),
+        ).grid(row=2, column=0, padx=2, pady=4, sticky="ew")
+        customtkinter.CTkButton(
+            self.tools_sections["Tools 2"],
+            text="Stop booster",
+            command=self._action_stop_booster_selected,
+            fg_color=ACCENT_RED,
+            hover_color="#962c38",
+            height=34,
+            font=customtkinter.CTkFont(size=11, weight="bold"),
+        ).grid(row=3, column=0, padx=2, pady=4, sticky="ew")
+        customtkinter.CTkButton(
+            self.tools_sections["Tools 2"],
+            text="Add game library",
+            command=self._action_open_add_game_library_popup,
+            fg_color=ACCENT_PURPLE,
+            hover_color=BG_BORDER,
+            height=34,
+            font=customtkinter.CTkFont(size=11, weight="bold"),
+        ).grid(row=4, column=0, padx=2, pady=4, sticky="ew")
+        self._switch_tools_section(self.tools_section_var.get())
+        
         lobby = customtkinter.CTkFrame(main, fg_color=BG_CARD, corner_radius=10, border_width=1, border_color=BG_BORDER)
         lobby.grid(row=1, column=1, columnspan=2, padx=(6, 0), pady=(0, 0), sticky="ew")
         customtkinter.CTkLabel(lobby, text="Lobby Management", text_color=TXT_MAIN, font=customtkinter.CTkFont(size=13, weight="bold")).grid(row=0, column=0, columnspan=2, padx=8, pady=(8, 4), sticky="w")
@@ -986,7 +1145,12 @@ class App(customtkinter.CTk):
 
         return frame
 
+    def _switch_tools_section(self, section_name):
+        for name, frame in getattr(self, "tools_sections", {}).items():
+            if name == section_name:
+                frame.tkraise()
     def _create_account_rows(self):
+        scroll_pos = self._get_accounts_scroll_position()
         self.account_row_items.clear()
         self.account_badges.clear()
 
@@ -1000,9 +1164,10 @@ class App(customtkinter.CTk):
                 corner_radius=8,
                 border_width=1,
                 border_color=BG_BORDER,
-                height=64,
+                height=78,
             )
             row.grid(row=idx, column=0, padx=4, pady=3, sticky="ew")
+            row.grid_propagate(False)
             row.grid_columnconfigure(0, weight=0)
             row.grid_columnconfigure(1, weight=1)
             row.grid_columnconfigure(2, weight=0)
@@ -1027,6 +1192,7 @@ class App(customtkinter.CTk):
             text_wrap = customtkinter.CTkFrame(row, fg_color="transparent")
             text_wrap.grid(row=0, column=1, rowspan=2, padx=(2, 6), pady=6, sticky="nsew")
             text_wrap.grid_columnconfigure(0, weight=1)
+            text_wrap.grid_columnconfigure(1, weight=0)
 
             login_label = customtkinter.CTkLabel(
                 text_wrap,
@@ -1045,9 +1211,12 @@ class App(customtkinter.CTk):
                 font=customtkinter.CTkFont(size=11),
             )
             level_label.grid(row=1, column=0, pady=(2, 0), sticky="ew")
+            status_wrap = customtkinter.CTkFrame(row, fg_color="transparent")
+            status_wrap.grid(row=0, column=2, rowspan=2, padx=(4, 8), pady=8, sticky="e")
+            status_wrap.grid_columnconfigure(0, weight=1)
 
             badge = customtkinter.CTkLabel(
-                row,
+                status_wrap,
                 text="Idle week",
                 text_color="#dbe8ff",
                 font=customtkinter.CTkFont(size=10),
@@ -1056,7 +1225,34 @@ class App(customtkinter.CTk):
                 width=84,
                 height=24,
             )
-            badge.grid(row=0, column=2, rowspan=2, padx=(4, 8), pady=10, sticky="e")
+            badge.grid(row=0, column=0, pady=(0, 4), sticky="e")
+
+            action_buttons = customtkinter.CTkFrame(status_wrap, fg_color="transparent")
+            action_buttons.grid(row=1, column=0, sticky="e")
+
+            customtkinter.CTkButton(
+                action_buttons,
+                text="Link",
+                width=64,
+                height=18,
+                fg_color=BG_CARD_ALT,
+                hover_color=BG_BORDER,
+                font=customtkinter.CTkFont(size=9, weight="bold"),
+                command=lambda login=account.login: self._open_steam_profile(login),
+            ).pack(side="left", padx=(0, 4))
+
+            customtkinter.CTkButton(
+                action_buttons,
+                text="⚙️",
+                width=24,
+                height=18,
+                fg_color=BG_CARD_ALT,
+                hover_color=BG_BORDER,
+                font=customtkinter.CTkFont(size=10),
+                command=lambda a=account: self._open_booster_settings(a),
+            ).pack(side="left")
+
+
 
             account.setColorCallback(lambda color, a=account: self._handle_account_color_change(a, color))
             self.account_badges[account.login] = badge
@@ -1082,14 +1278,14 @@ class App(customtkinter.CTk):
             )
 
             self._refresh_account_badge(account)
-
+        self._restore_accounts_scroll_position(scroll_pos)
         
 
 
                 
     def _refresh_level_labels(self):
         try:
-            self.levels_cache = self._load_levels_from_json()
+
 
             levels_cache = self.levels_cache or {}
             levels_cache_lower = {str(k).lower(): v for k, v in levels_cache.items()}
@@ -1113,7 +1309,7 @@ class App(customtkinter.CTk):
                     changed = True
 
             if changed:
-                self.after_idle(self._refresh_accounts_scroll_layout)
+                self.after_idle(self._schedule_accounts_scroll_refresh)
 
         except Exception:
             pass
@@ -1124,6 +1320,7 @@ class App(customtkinter.CTk):
             mtime = level_path.stat().st_mtime if level_path.exists() else None
             if mtime != self._level_file_mtime:
                 self._level_file_mtime = mtime
+                self.levels_cache = self._load_levels_from_json()
                 self._refresh_level_labels()
         except Exception:
             pass
@@ -1140,6 +1337,7 @@ class App(customtkinter.CTk):
             elif self.is_drop_ready_account(account):
                 normalized = "#a855f7"
         def apply_change():
+
             for item in self.account_row_items:
                 if item["account"] is account:
                     item["login_label"].configure(text_color=normalized)
@@ -1193,14 +1391,14 @@ class App(customtkinter.CTk):
             self._save_levels_to_json()
 
         if account_data.get("trade_sent_week_start") == week_start_iso:
-            return "Sent trade", ACCENT_ORANGE
+            return "📤 Sent trade", ACCENT_ORANGE
 
         current_level = account_data.get("level")
         baseline_level = account_data.get("weekly_baseline_level")
         if isinstance(current_level, int) and isinstance(baseline_level, int) and current_level >= baseline_level + 1:
-            return "Take drop", ACCENT_GREEN
+            return "🎁 Take drop", ACCENT_GREEN
 
-        return "Idle week", ACCENT_BLUE
+        return "🛌 Idle week", ACCENT_BLUE
 
     def _refresh_all_runtime_states(self):
         changed = False
@@ -1230,7 +1428,7 @@ class App(customtkinter.CTk):
         def poll():
             try:
                 self._refresh_all_runtime_states()
-                self._refresh_level_labels_if_changed()
+
             except Exception:
                 pass
             finally:
@@ -1243,7 +1441,7 @@ class App(customtkinter.CTk):
         filter_text = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
         render_idx = 0
         changed = False
-
+        scroll_pos = self._get_accounts_scroll_position()
         for item in self.account_row_items:
             should_show = not filter_text or filter_text in item["login_lower"]
             was_visible = item["ui_state"]["visible"]
@@ -1266,10 +1464,34 @@ class App(customtkinter.CTk):
 
         if changed:
             self._schedule_accounts_scroll_refresh()
+            self._restore_accounts_scroll_position(scroll_pos)
+
+    def _get_accounts_scroll_position(self):
+        try:
+            canvas = getattr(self.accounts_scroll, "_parent_canvas", None)
+            if canvas:
+                start, _ = canvas.yview()
+                return start
+        except Exception:
+            pass
+        return None
+
+    def _restore_accounts_scroll_position(self, position):
+        if position is None:
+            return
+        try:
+            canvas = getattr(self.accounts_scroll, "_parent_canvas", None)
+            if canvas:
+                canvas.yview_moveto(position)
+        except Exception:
+            pass
+            
     def _refresh_accounts_scroll_layout(self):
         try:
             if hasattr(self, "accounts_scroll") and self.accounts_scroll.winfo_exists():
+                scroll_pos = self._get_accounts_scroll_position()
                 self.accounts_scroll.update_idletasks()
+                self._restore_accounts_scroll_position(scroll_pos)
         except Exception:
             pass  
 
@@ -2015,7 +2237,14 @@ class App(customtkinter.CTk):
     def _action_try_get_level(self):
         if not self._ensure_license():
             return
-        self._run_action_async(self.accounts_control.try_get_level, lambda _: self.after(300, self._refresh_level_labels))
+        selected_accounts = self.account_manager.selected_accounts.copy()
+        if not selected_accounts:
+            self.log_manager.add_log("⚠️ Нет выделенных аккаунтов")
+            return
+        self._run_action_async(
+            lambda: self.fetch_levels_for_accounts(selected_accounts),
+            lambda _: self.after(150, self._refresh_level_labels),
+        )
 
     def _action_kill_all_cs_and_steam(self):
         if not self._ensure_license():
@@ -2032,6 +2261,532 @@ class App(customtkinter.CTk):
             return
         self._run_action_async(self.control_frame.launch_bes)
 
+    def _action_launch_steam_selected(self):
+        if not self._ensure_license():
+            return
+        self._run_action_async(self.accounts_control.launch_steam_selected)
+
+    def _action_start_booster_selected(self):
+        if not self._ensure_license():
+            return
+        self._run_action_async(self.accounts_control.start_booster_selected)
+    def _action_stop_booster_selected(self):
+        if not self._ensure_license():
+            return
+        self._run_action_async(self.accounts_control.stop_booster_selected)
+
+    def _position_popup_inside_ui(self, popup, width, height):
+        self.update_idletasks()
+        popup.update_idletasks()
+        parent_x = self.winfo_rootx()
+        parent_y = self.winfo_rooty()
+        parent_w = self.winfo_width()
+        parent_h = self.winfo_height()
+        pos_x = parent_x + max(12, (parent_w - width) // 2)
+        pos_y = parent_y + max(12, (parent_h - height) // 2)
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        pos_x = max(0, min(pos_x, screen_w - width))
+        pos_y = max(0, min(pos_y, screen_h - height))
+        popup.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+
+    def _parse_library_targets_from_input(self, raw_value):
+        if not raw_value:
+            return [], ["Пустой ввод"]
+
+        tokens = [token.strip() for token in raw_value.split(",") if token.strip()]
+        targets = []
+        errors = []
+        seen = set()
+
+        for token in tokens:
+            target = None
+            if token.isdigit():
+                target = str(int(token))
+            else:
+                token_lower = token.lower()
+                sub_match = re.search(r"(?:/sub/|subid\D*)(\d+)", token, re.IGNORECASE)
+                if sub_match:
+                    target = f"subid:{int(sub_match.group(1))}"
+                else:
+                    app_match = re.search(r"(?:store\.steampowered\.com|steamcommunity\.com)/app/(\d+)", token, re.IGNORECASE)
+                    if app_match:
+                        target = str(int(app_match.group(1)))
+                    else:
+                        prefixed_sub_match = re.search(r"^subid\s*[:=]?\s*(\d+)$", token_lower, re.IGNORECASE)
+                        if prefixed_sub_match:
+                            target = f"subid:{int(prefixed_sub_match.group(1))}"
+
+            if not target:
+                errors.append(f"Не удалось распознать AppID/SubID из: {token}")
+                continue
+
+            if target in seen:
+                continue
+            seen.add(target)
+            targets.append(target)
+
+        return targets, errors
+
+    def _extract_free_package_id(self, app_payload):
+        if not isinstance(app_payload, dict):
+            return None
+
+        package_groups = app_payload.get("package_groups") or []
+        for group in package_groups:
+            for sub in group.get("subs", []):
+                try:
+                    package_id = int(sub.get("packageid") or 0)
+                except Exception:
+                    package_id = 0
+                if package_id <= 0:
+                    continue
+
+                is_free_license = bool(sub.get("is_free_license"))
+                cents = sub.get("price_in_cents_with_discount")
+                is_zero_price = isinstance(cents, int) and cents == 0
+                option_text = str(sub.get("option_text") or "").lower()
+                if is_free_license or is_zero_price or "$0" in option_text or "free" in option_text:
+                    return package_id
+
+        for package_id in app_payload.get("packages") or []:
+            try:
+                package_id_int = int(package_id)
+            except Exception:
+                continue
+            if package_id_int > 0:
+                return package_id_int
+
+        return None
+
+    def _check_app_is_free_and_get_package(self, steam_session, app_id):
+        url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&cc=us&l=en"
+        response = steam_session.session.get(url, timeout=15)
+        if response.status_code != 200:
+            return None, f"HTTP {response.status_code} при проверке appid {app_id}"
+
+        data = response.json()
+        app_node = data.get(str(app_id)) or {}
+        if not app_node.get("success"):
+            return None, f"appid {app_id} не найден в Store API"
+
+        app_payload = app_node.get("data") or {}
+        is_free_flag = bool(app_payload.get("is_free"))
+        package_id = self._extract_free_package_id(app_payload)
+
+        if not is_free_flag and not package_id:
+            return None, f"appid {app_id} не бесплатная или нет доступного free package"
+
+        return package_id, None
+
+    def _add_free_game_to_library(self, steam_session, app_id):
+        def _is_app_in_library():
+            try:
+                check_response = steam_session.session.get(
+                    "https://store.steampowered.com/dynamicstore/userdata/",
+                    timeout=15,
+                )
+            except Exception:
+                return None
+
+            if check_response.status_code != 200:
+                return None
+
+            try:
+                check_payload = check_response.json()
+            except Exception:
+                return None
+
+            owned_apps = check_payload.get("rgOwnedApps")
+            if isinstance(owned_apps, list):
+                try:
+                    return int(app_id) in {int(x) for x in owned_apps}
+                except Exception:
+                    return str(app_id) in {str(x) for x in owned_apps}
+            return None
+
+        app_already_owned_before = _is_app_in_library()
+        if app_already_owned_before is True:
+            return True, f"appid {app_id} уже есть в библиотеке"
+        package_id, package_error = self._check_app_is_free_and_get_package(steam_session, app_id)
+        if package_error:
+            return False, package_error
+        if not package_id:
+            return False, f"Для appid {app_id} не найден package_id для добавления"
+
+        payload = {
+            "action": "add_to_cart",
+            "sessionid": steam_session.session_id,
+            "subid": package_id,
+        }
+        response = steam_session.session.post(
+            "https://store.steampowered.com/checkout/addfreelicense",
+            data=payload,
+            timeout=20,
+        )
+        if response.status_code != 200:
+            return False, f"HTTP {response.status_code} addfreelicense для appid {app_id}"
+
+        response_text = (response.text or "").lower()
+
+        try:
+            response_payload = response.json()
+        except Exception:
+            response_payload = {}
+
+        success_value = response_payload.get("success")
+        if isinstance(success_value, bool):
+            success_flag = success_value
+        elif isinstance(success_value, int):
+            success_flag = success_value == 1
+        else:
+            success_flag = None
+
+        app_owned_after = _is_app_in_library()
+        if app_owned_after is True:
+            if app_already_owned_before is True:
+                return True, f"appid {app_id} уже есть в библиотеке"
+            return True, f"appid {app_id} добавлен (subid {package_id})"
+
+        if "already" in response_text or "owned" in response_text:
+            # Для части аккаунтов Steam может вернуть "already owned", даже если
+            # dynamicstore/userdata еще не обновился или скрывает библиотеку.
+            # В этом случае считаем операцию успешной и не прерываем батч ошибкой.
+            return True, f"Steam вернул owned/already для appid {app_id} (считаем как уже добавлен)"
+
+        if success_flag is True:
+            return True, f"appid {app_id} добавлен (subid {package_id})"
+
+        return False, f"Не удалось подтвердить добавление appid {app_id}: {response.text[:180]}"
+
+    def _action_open_add_game_library_popup(self):
+        if not self._ensure_license():
+            return
+
+        popup = customtkinter.CTkToplevel(self)
+        popup.title("Add game library")
+        popup.geometry("520x250")
+        popup.resizable(False, False)
+        popup.transient(self)
+        popup.grab_set()
+        popup.configure(fg_color=BG_CARD_ALT)
+        self._position_popup_inside_ui(popup, 520, 250)
+
+        content = customtkinter.CTkFrame(
+            popup,
+            fg_color=BG_CARD,
+            corner_radius=10,
+            border_width=1,
+            border_color=BG_BORDER,
+        )
+        content.pack(fill="both", expand=True, padx=12, pady=12)
+
+        customtkinter.CTkLabel(
+            content,
+            text="Добавление бесплатных игр в библиотеку",
+            font=customtkinter.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        customtkinter.CTkLabel(
+            content,
+            text="Вставьте AppID/SubID или ссылку (через запятую):\n730, https://store.steampowered.com/app/730/CounterStrike_2",
+            justify="left",
+            text_color=TXT_SOFT,
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+
+        input_entry = customtkinter.CTkEntry(
+            content,
+            placeholder_text="730, subid:1576481, https://store.steampowered.com/app/730/",
+        )
+        input_entry.pack(fill="x", padx=12, pady=(0, 10))
+
+        def run_add():
+            selected_accounts = self.account_manager.selected_accounts.copy()
+            if not selected_accounts:
+                self.log_manager.add_log("⚠️ Выделите хотя бы 1 аккаунт для Add game library")
+                return
+
+            raw_value = input_entry.get().strip()
+            targets, parse_errors = self._parse_library_targets_from_input(raw_value)
+            if parse_errors:
+                for message in parse_errors:
+                    self.log_manager.add_log(f"❌ {message}")
+            if not targets:
+                self.log_manager.add_log("❌ Нет валидных AppID/SubID для добавления")
+                return
+
+
+            popup.destroy()
+
+            def worker():
+                add_script_path = Path(__file__).resolve().parent.parent / "add_game_library.js"
+                if not add_script_path.exists():
+                    self.log_manager.add_log(f"❌ Не найден скрипт: {add_script_path}")
+                    return
+
+                targets_csv = ",".join(str(x) for x in targets)
+                for target_account in selected_accounts:
+                    if not target_account.shared_secret:
+                        self.log_manager.add_log(f"❌ [{target_account.login}] Нет shared_secret для Add game library")
+                        continue
+
+                    command = [
+                        "node",
+                        str(add_script_path),
+                        str(target_account.login),
+                        str(target_account.password),
+                        str(target_account.shared_secret),
+                        targets_csv,
+                    ]
+                    try:
+                        node_env = os.environ.copy()
+                        node_env["NODE_NO_WARNINGS"] = "1"
+                        result = subprocess.run(
+                            command,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            timeout=300,
+                            env=node_env,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                    except Exception as exc:
+                        self.log_manager.add_log(f"❌ [{target_account.login}] Ошибка запуска add_game_library.js: {exc}")
+                        continue
+
+                    stdout_lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+                    stderr_lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+
+                    for line in stdout_lines:
+                        self.log_manager.add_log(f"[add_game_library.js][{target_account.login}] {line}")
+
+                    if result.returncode == 0:
+                        continue
+                    else:
+                        if stderr_lines:
+                            for line in stderr_lines:
+                                self.log_manager.add_log(f"❌ [{target_account.login}] {line}")
+                        elif stdout_lines:
+                            continue
+                        else:
+                            self.log_manager.add_log(
+                                f"❌ [{target_account.login}] Add game library завершился с кодом {result.returncode}"
+                            )
+
+
+            self._run_action_async(worker)
+
+        buttons = customtkinter.CTkFrame(content, fg_color="transparent")
+        buttons.pack(fill="x", padx=12, pady=(4, 12))
+        buttons.grid_columnconfigure((0, 1), weight=1)
+
+        customtkinter.CTkButton(
+            buttons,
+            text="Добавить на выбранные аккаунты",
+            command=run_add,
+            fg_color=ACCENT_BLUE,
+            hover_color=ACCENT_BLUE_DARK,
+        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        customtkinter.CTkButton(
+            buttons,
+            text="Отмена",
+            command=popup.destroy,
+            fg_color=BG_CARD_ALT,
+            hover_color=BG_BORDER,
+        ).grid(row=0, column=1, padx=(6, 0), sticky="ew")
+    def _open_steam_profile(self, login):
+        if not self._ensure_license():
+            return
+        self.accounts_control.open_steam_profile(login)
+
+    def _open_booster_settings(self, account=None):
+        if not self._ensure_license():
+            return
+
+        popup = customtkinter.CTkToplevel(self)
+        popup.title("Booster settings")
+        popup.geometry("380x300")
+        popup.resizable(False, False)
+        popup.transient(self)
+        popup.grab_set()
+        popup.grid_columnconfigure(0, weight=1)
+        popup.grid_rowconfigure(1, weight=1)
+        popup.configure(fg_color=BG_CARD_ALT)
+
+
+        width, height = 380, 300
+        
+        self._position_popup_inside_ui(popup, width, height)
+
+        content = customtkinter.CTkFrame(
+            popup,
+            fg_color=BG_CARD,
+            corner_radius=10,
+            border_width=1,
+            border_color=BG_BORDER,
+        )
+        content.grid(row=0, column=0, padx=12, pady=12, sticky="nsew")
+        content.grid_columnconfigure(1, weight=1)
+        
+
+        customtkinter.CTkLabel(
+            content,
+            text="Параметры ротации и игр",
+            font=customtkinter.CTkFont(size=14, weight="bold"),
+        ).grid(row=0, column=0, columnspan=2, padx=12, pady=(12, 6), sticky="w")
+
+        if account:
+            customtkinter.CTkLabel(
+                content,
+                text=f"Логин: {account.login}",
+                text_color=TXT_MUTED,
+                font=customtkinter.CTkFont(size=11),
+            ).grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="w")
+
+        account_configs = self.settings_manager.get("ActivityBoosterAccounts", {}) or {}
+        if not isinstance(account_configs, dict):
+            account_configs = {}
+
+        global_min = self.settings_manager.get("ActivityBoosterMinMinutes", 60)
+        global_max = self.settings_manager.get("ActivityBoosterMaxMinutes", 100)
+        global_games = self.settings_manager.get("ActivityBoosterGameAppIds", []) or []
+
+        account_data = {}
+        if account:
+            account_data = account_configs.get(account.login, {})
+            if not isinstance(account_data, dict):
+                account_data = {}
+
+        min_initial = account_data.get("min_minutes", global_min)
+        max_initial = account_data.get("max_minutes", global_max)
+        games_initial = account_data.get("game_appids", global_games)
+        if isinstance(games_initial, list):
+            games_initial = ",".join(str(x) for x in games_initial if str(x).strip())
+        else:
+            games_initial = ""
+
+        customtkinter.CTkLabel(content, text="Min (мин):").grid(row=2, column=0, padx=12, pady=6, sticky="w")
+        min_entry = customtkinter.CTkEntry(content, width=120)
+        min_entry.grid(row=2, column=1, padx=12, pady=6, sticky="ew")
+        min_entry.insert(0, str(min_initial))
+
+        customtkinter.CTkLabel(content, text="Max (мин):").grid(row=3, column=0, padx=12, pady=6, sticky="w")
+        max_entry = customtkinter.CTkEntry(content, width=120)
+        max_entry.grid(row=3, column=1, padx=12, pady=6, sticky="ew")
+        max_entry.insert(0, str(max_initial))
+
+        customtkinter.CTkLabel(
+            content,
+            text="AppID игр (до 5, через запятую, 0 = случайные):",
+            justify="left",
+            wraplength=320,
+        ).grid(row=4, column=0, columnspan=2, padx=12, pady=(8, 2), sticky="w")
+        games_entry = customtkinter.CTkEntry(content, width=220, placeholder_text="730,570,440")
+        games_entry.grid(row=5, column=0, columnspan=2, padx=12, pady=(2, 8), sticky="ew")
+        games_entry.insert(0, games_initial)
+
+        def parse_form_values():
+            try:
+                min_minutes = max(1, int(min_entry.get().strip()))
+                max_minutes = max(min_minutes, int(max_entry.get().strip()))
+            except ValueError:
+                self.log_manager.add_log("❌ Booster settings: введите целые числа")
+                return None
+
+            raw_games = games_entry.get().strip()
+            if raw_games:
+                tokens = [t.strip() for t in raw_games.replace(";", ",").replace(" ", ",").split(",") if t.strip()]
+                if any(not token.isdigit() for token in tokens):
+                    self.log_manager.add_log("❌ Booster settings: AppID должны быть числами")
+                    return None
+
+                token_values = [int(token) for token in tokens]
+                if 0 in token_values:
+                    game_appids = []
+                else:
+                    parsed = []
+                    seen = set()
+                    for app_id in token_values:
+                        if app_id <= 0:
+                            self.log_manager.add_log("❌ Booster settings: AppID должны быть > 0 или 0 для случайных игр")
+                            return None
+                        if app_id in seen:
+                            continue
+                        parsed.append(app_id)
+                        seen.add(app_id)
+                    if len(parsed) > 5:
+                        self.log_manager.add_log("❌ Booster settings: максимум 5 AppID")
+                        return None
+                    game_appids = parsed
+            else:
+                game_appids = []
+
+            return min_minutes, max_minutes, game_appids
+
+        def apply_to_account():
+            if not account:
+                self.log_manager.add_log("⚠️ Откройте настройки через кнопку ⚙️ у конкретного аккаунта")
+                return
+
+            parsed_values = parse_form_values()
+            if not parsed_values:
+                return
+
+            min_minutes, max_minutes, game_appids = parsed_values
+            account_configs_local = self.settings_manager.get("ActivityBoosterAccounts", {}) or {}
+            if not isinstance(account_configs_local, dict):
+                account_configs_local = {}
+
+            account_configs_local[account.login] = {
+                "min_minutes": min_minutes,
+                "max_minutes": max_minutes,
+                "game_appids": game_appids,
+            }
+            self.settings_manager.set("ActivityBoosterAccounts", account_configs_local)
+            games_info = ",".join(str(x) for x in game_appids) if game_appids else "случайные игры"
+            self.log_manager.add_log(
+                f"✅ [{account.login}] Booster settings сохранены: {min_minutes}-{max_minutes} мин., игры: {games_info}"
+            )
+            popup.destroy()
+
+        def apply_to_all():
+            parsed_values = parse_form_values()
+            if not parsed_values:
+                return
+
+            min_minutes, max_minutes, game_appids = parsed_values
+
+            self.settings_manager.set("ActivityBoosterMinMinutes", min_minutes)
+            self.settings_manager.set("ActivityBoosterMaxMinutes", max_minutes)
+            self.settings_manager.set("ActivityBoosterGameAppIds", game_appids)
+            games_info = ",".join(str(x) for x in game_appids) if game_appids else "случайные игры"
+            self.log_manager.add_log(
+                f"✅ Booster settings для всех сохранены: {min_minutes}-{max_minutes} мин., игры: {games_info}"
+            )
+            popup.destroy()
+
+        buttons_row = customtkinter.CTkFrame(content, fg_color="transparent")
+        buttons_row.grid(row=6, column=0, columnspan=2, padx=12, pady=(8, 12), sticky="ew")
+        buttons_row.grid_columnconfigure(0, weight=1)
+        buttons_row.grid_columnconfigure(1, weight=1)
+        customtkinter.CTkButton(
+            buttons_row,
+            text="Применить к аккаунту",
+            command=apply_to_account,
+            fg_color=ACCENT_BLUE,
+            hover_color=ACCENT_BLUE_DARK,
+        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        customtkinter.CTkButton(
+            buttons_row,
+            text="Применить ко всем",
+            command=apply_to_all,
+            fg_color=ACCENT_PURPLE,
+            hover_color="#6c41d4",
+        ).grid(row=0, column=1, padx=(6, 0), sticky="ew")
+        
     def _action_try_get_wingman_rank(self):
         if not self._ensure_license():
             return
@@ -3063,6 +3818,11 @@ class App(customtkinter.CTk):
                 pass
         try:
             self._save_window_position()
+        except Exception:
+            pass
+        try:
+            if self.accounts_control:
+                self.accounts_control.stop_all_boosters()
         except Exception:
             pass
         try:

@@ -46,7 +46,7 @@ T_ACTIONS_LONG = T_ACTIONS_SECOND = [
     
 ]
 
-RANDOM_PRE_LONG_KEYS = ["z", "x", "c", "v",  "n",  "ins", "home"]
+RANDOM_PRE_LONG_KEYS = ["z", "x", "c", "v",  "n",  "o", "l"]
 
 
 # =========================
