@@ -158,4 +158,4 @@ client.logOn({
     password,
     twoFactorCode: SteamTotp.getAuthCode(sharedSecret),
     machineName: `booster_${login}`,
-});
+}); 
