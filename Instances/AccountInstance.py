@@ -526,8 +526,21 @@ class Account:
         except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
             return False
         return False
-        
+
         return False
+
+    def isSteamValid(self):
+        if self.steamProcess is None:
+            return False
+
+        try:
+            if not psutil.pid_exists(self.steamProcess.pid):
+                return False
+            steam_proc = psutil.Process(self.steamProcess.pid)
+            return (steam_proc.name() or "").lower() == "steam.exe"
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
+            return False
+
     def setColorCallback(self, callback):
         """Регистрируем callback, который будет вызываться при смене цвета"""
         self._color_callback = callback
@@ -824,6 +837,46 @@ class Account:
 
         except Exception as e:
             print(f"Ошибка записи runtime.json: {e}")
+
+    def StartSteamOnly(self, login_timeout=25):
+        print(f"Запуск только Steam для [{self.login}]...")
+        steam_path = self._settingsManager.get("SteamPath", r"C:\Program Files (x86)\Steam\steam.exe")
+
+        if not os.path.isfile(steam_path) or not steam_path.lower().endswith(".exe"):
+            raise FileNotFoundError(f"Некорректный SteamPath: {steam_path}")
+
+        if self.isSteamValid() and not self.isCSValid():
+            print(f"ℹ️ Steam [{self.login}] уже запущен, повторный старт не требуется")
+            return
+
+        try:
+            WinregHelper.set_value(
+                r"Software\Valve\Steam",
+                "AutoLoginUser",
+                self.login,
+                winreg.REG_SZ
+            )
+
+            launch_args = shlex.split(
+                self._settingsManager.get("SteamArg", "-nofriendsui -vgui -noreactlogin")
+            )
+            self.steamProcess = launch_isolated_steam(self.login, steam_path, launch_args)
+            self.CS2Process = None
+
+            deadline = time.time() + max(5, int(login_timeout))
+            while time.time() < deadline:
+                if not self.isSteamValid():
+                    raise RuntimeError("Steam завершился во время авторизации")
+
+                self.ProcessWindowsBeforeCS(self.steamProcess.pid)
+                time.sleep(0.75)
+
+            self.setColor("#5dade2")
+            print(f"✅ Steam-only запуск завершён для [{self.login}] (PID {self.steamProcess.pid})")
+        except Exception:
+            self.steamProcess = None
+            self.CS2Process = None
+            raise
 
 
     def restart_steam_on_error(self, steam_pid, timeout=60):
